@@ -198,8 +198,14 @@
 ;	     Make ISR handle multiple events per invocation to reduce latency
 ;	     and overhead when interrupts happen during interrupts.
 ;
+; 042	-- Major restructuring around the termainal main loop and subroutine
+;	     calls for the basic I/O functions, adapting a quick call scheme
+;	     for those time critical things. Changed the jump tables from
+;	     plain addresses to LBR instructions to avoid need for SEP stuff.
+;	     Other changes and restructuring to support this.
+;
 ;--
-VEREDT	.EQU	41	; and the edit level
+VEREDT	.EQU	42	; and the edit level
 ;
 ; TODO list-
 ;   Drawing boxes and lines should be easier - maybe some kind of escape
@@ -545,6 +551,10 @@ DLYCONS	.EQU	CPUCLOCK/32000
 #define CALL(ADDR)	SEP CALLPC\ .WORD ADDR
 #define RETURN		SEP RETPC
 
+; Quick subroutine call macro...
+#define QCALL(ADDR)	LDI LOW($)+5\ LBR ADDR
+#define QRETURN		INC SP\ LDN SP\ PLO PC
+
 ;   Push or pop the D register from the stack.  Note that POPD assumes the SP
 ; is in the usual position (pointing to a free byte on the TOS) and it does the
 ; IRX for you!  That's because 1802 stack operations are BOTH pre-increment AND
@@ -628,17 +638,26 @@ DLYCONS	.EQU	CPUCLOCK/32000
 	.ORG	DPBASE
 
 ; Other random VT52 emulator context variables...
-;   WARNING!! DO NOT CHANGE THE ORDER OF TOPLIN, CURSX and CURSY!  The code
-; DEPENDS on these three bytes being in this particular order!!!
-ACSMOD:	.BLOCK	1	; != 0 for alternate character set mode
-TOPLIN: .BLOCK	1	; the number of the top line on the screen
-CURSX:	.BLOCK	1	; the column number of the cursor
-CURSY:	.BLOCK	1	; the row number of the cursor
-HIDCURS:.BLOCK	1	; != 0 to hide the cursor
+
+;   WARNING!! DO NOT CHANGE THE ORDER OF THE FIVE VARIABLES IN THIS BLOCK!
+; The code DEPENDS on these bytes being in this particular order!!!
+;
+; A note about VISCUR in particular... this byte is a flag that is zero if
+; the cursor should be hidden, or CC.LCUR if it should be visible. The true
+; value is because the block of the three bytes [VISCUR, CURSX, CURSY] are
+; output to the 8275 in sequence to set the cursor position.
+;
+ACSMOD:	.BLOCK	1	; zero for normal character set else alternate
+TOPLIN: .BLOCK	1	; number of the top line on screen (0 to MAXROW-1)
+VISCUR:	.BLOCK	1	; zero to hide the cursor else CC.LCUR to show
+CURSX:	.BLOCK	1	; the column number of the cursor (0 to MAXCOL-1)
+CURSY:	.BLOCK	1	; the row number of the cursor (0 to MAXROW-1)
+
 ; DON'T CHANGE THE GROUPING OF ESCSTA, CURCHR and SAVCHR!!
 ESCSTA:	.BLOCK	1	; current ESCape state machine state
 CURCHR:	.BLOCK	1	; character we're trying to output
 SAVCHR:	.BLOCK	1	; save one character for escape sequences
+
 ; Other variables ...
 TTIMER:	.BLOCK	1	; timer for tones and ^G bell beeper
 SERBRK:	.BLOCK	1	; serial port break flag
@@ -940,10 +959,12 @@ RAMIN1:	LDI 0\ STXD\ GHI T1	; zero another byte
 	CALL(VTINI)		; initialize the i8275 display
 	RLDI(INTPC,ISR)		; point R1 to the interrupt service code
 	ION			; take a a big leap of faith!
-	CALL(ERASE)		; erase the screen and home the cursor
+
+	CALL(TOUT)		; output to terminal temporarily
+	INLMES("\007\014\033d")	; ring bell, clear screen, show cursor
+
 	CALL(DSPON)		; turn the 8275 video on
 	OUTI(FLAGS,FL.LON)	; turn the CPU OK LED OM
-	CALL(BELL)		; and sound the bell
 
 				; and fall into the software startup next
 
@@ -995,6 +1016,8 @@ SYSIN3:	CALL(TCRLF)		; ...
 ;   This is the monitor main loop - it prints a prompt, scans a command,
 ; looks up the command name, and then dispatches to the appropriate routine.
 ;--
+MAINTE:	OUTSTR(TEMSG)		; print a message if entering from terminal
+
 MAIN:	RLDI(CALLPC,SCALL)	; reset our SCRT pointers, just in case
 	RLDI(RETPC,SRETURN)	; ...
 	RLDI(SP,STACK)\ SEX SP	; reset the stack pointer to the TOS
@@ -1542,6 +1565,39 @@ PHELP:	CALL(CHKEOL)		; HELP has no arguments
 	.SBTTL	TERM Emulator
 
 ;++
+;   The following code uses a "quick call" subroutine convention rather than
+; SCRT for speed reasons. The quick call format only stores a one-byte return
+; address representing the address within the page the call occurred from.
+; The return is effected by a simple PLO PC from a location within the same
+; page as the caller. Calling convention looks like:
+;
+;	LDI $+5\ LBR SUBR
+;
+; This passes the return address to the subroutine in D, which it pushes to
+; the stack.  The return at the end of the subroutine is then simply:
+;
+;	IRX\ LDX\ PLO PC
+;
+; As can be seen, this only takes eleven machine cycles versus the 66 cycles
+; that standard call costs, but obviously with limitations, including that
+; the subroutine must return from the same page it was called from. This is
+; accomplished by a return stub that can be jumped to.
+;
+; To hide a little bit of this, macros have been created for the above:
+;
+;	QCALL(SUBR)
+;	QRETURN
+;
+; Since D is used to pass the return address, and destroyed on return, it
+; can't be used to pass values, so will will generally do that in AUX.1 when
+; single-byte arguments are used.
+;
+; For the cases where a function needs to be used through standard call,
+; there is a simple wrapper around the quick call to save registers and 
+; change argument passing between AUX and D as needed.
+;--
+
+;++
 ;   This is your basic terminal emulator.  It simply copies characters from
 ; the serial port to the screen, and from the keyboard to the serial port.
 ; Notice that this routine loops forever, however you can get to the command
@@ -1550,45 +1606,124 @@ PHELP:	CALL(CHKEOL)		; HELP has no arguments
 ;
 ;   TTERM is an alternate entry used by the TERM command.
 ;--
+
 TTERM:	CALL(CHKEOL)
 	OUTSTR(TTMSG)
 
-TERM:	RLDI(T1,KEYBRK)\ SEX T1	; clear both the KEYMNU and KEYBRK flags
-	LDI 0\ STXD\ STXD	; ...
+TERM:	RLDI(T1,KEYBRK)		; clear both the KEYMNU and KEYBRK flags
+	LDI 0\ STR T1\ DEC T1
+	STR T1\ DEC T1
 	RLDI(T1,SERBRK)		; and clear the serial break flag too
 	LDI 0\ STR T1		; ...
 
+	LBR TERM1\ PAGE		; make short branches and calls align
+
 TERM1:	RLDI(T1,KEYMNU)		; was the menu key pressed ?
-	LDN T1\ LBZ TERM2	; no - go check for serial break
+	LDN T1\ BZ TERM2	; no - go check for serial break
 	LDI 0\ STR T1		; yes - clear the menu key flag
-	OUTSTR(TEMSG)		; print a message
-	LBR MAIN		; and start up the command scanner
+	LBR MAINTE		; and start up the command scanner
 
 TERM2:	LDI LOW(SERBRK)\ PLO T1	; was a serial break received ?
-	LDN T1\ LBZ TERM3	; no - go check for keyboard break
+	LDN T1\ BZ TERM3	; no - go check for keyboard break
 	LDI 0\ STR T1		; yes - clear the serial break flag
 
 TERM3:	LDI LOW(KEYBRK)\ PLO T1	; was the BREAK key pressed ?
-	LDN T1\ LBZ TERM4	; no - go check for serial input
+	LDN T1\ BZ TERM4	; no - go check for serial input
 	LDI 0\ STR T1		; yes - clear the KEYBRK flag
 	CALL(TXSBRK)		; and send a break on the serial port
 
-TERM4:	CALL(SERGET)		; anything in the buffer
-	LBDF TERM5		; no - check the PS/2 keyboard
-	CALL(VTPUTT)		; yes - send this character to the screen
+TERM4:	QCALL(SERGEQ)		; anything in the buffer
+	BDF TERM5		; no - check the PS/2 keyboard
+	QCALL(VTPUTQ)
+	BR TERM4
 
-	CALL(SERGET)		; anything in the buffer
-	LBDF TERM5		; no - check the PS/2 keyboard
-	CALL(VTPUTT)		; yes - send this character to the screen
+TERM5:	QCALL(GETKEQ)		; anything waiting from the keyboard?
+	BDF TERM1		; no - back to checking the serial port
+	QCALL(SERPUQ)		; yes - send it to the serial port
+	BR TERM1		; and keep going
 
-	CALL(SERGET)		; anything in the buffer
-	LBDF TERM5		; no - check the PS/2 keyboard
-	CALL(VTPUTT)		; yes - send this character to the screen
+SHRET:	QRETURN			; get the return address
 
-TERM5:	CALL(GETKEY)		; anything waiting from the keyboard?
-	LBDF TERM1		; no - back to checking the serial port
-	CALL(SERPUT)		; yes - send it to the serial port
-	LBR TERM1		; and keep going
+	.SBTTL	Serial Port Standard Call Wrapper Routines
+
+;++
+;   This is an SCRT wrapper around the SERGEQ quick-call subroutine so that
+; it can be used by BASIC and the monitor through CALL(SERGET). This gets one
+; character from the serial port and returns it in D, except if none are
+; available, in which case it sets DF. 
+;--
+
+SERGET:	PUSHR(T1)		; save a temporary register
+	QCALL(SERGEQ)
+	IRX\ POPRL(T1)		; restore T1 from stack
+	GHI AUX\ RETURN
+
+;++
+;  This is just like SERGET, except that it will wait for input if none is
+; available now.  There's no timeout on the wait!
+;--
+
+SERGEW:	PUSHR(T1)		; save a temporary register
+SERGE3:	QCALL(SERGEQ)
+	BDF SERGE3
+	IRX\ POPRL(T1)		; restore T1 from stack
+	GHI AUX\ RETURN
+
+;++
+;   This is an SCRT wrapper around the SERPUQ quick-call subroutine so that
+; it can be used by BASIC and the monitor through CALL(SERPUT). This sends
+; one character to the serial port, which is passed in D.
+;--
+
+SERPUT:	PHI AUX\ PUSHR(T1)	; save a temporary register
+	QCALL(SERPUQ)
+	IRX\ POPRL(T1)		; restore T1
+	GHI AUX\ RETURN		; and we're done
+
+;++
+;   And this routine is just like SERPUT, except that it will wait for space
+; to be available if the buffer is currently full.
+;--
+
+SERPUW:	PHI AUX\ PUSHR(T1)	; save a temporary register
+SERPU3:	QCALL(SERPUQ)
+	BDF SERPU3
+	IRX\ POPRL(T1)		; restore T1
+	GHI AUX\ RETURN		; and we're done
+
+;++
+;   This is an SCRT wrapper around the GETKEQ quick-call subroutine so that
+; it can be used by BASIC and the monitor through CALL(GETKEQ). This gets
+; one character from the keyboard and returns it in D, except if none are
+; available, in which case it sets DF. 
+;--
+
+GETKEY:	PUSHR(T1)\ PUSHR(T2)	; save two working registers
+	QCALL(GETKEQ)
+	IRX\ POPR(T2)\ POPRL(T1); restore saved registers
+	GHI AUX\ RETURN		; and we're done
+
+	.SBTTL	Output Characters to the Screen
+
+;++
+;   This is a wrapper around the VTPUTQ routine to save the registers that
+; BASIC or command mode may need preserved but that the terminal routine
+; does not (which calls VTPUTQ directly). This saves the overhead of the
+; save and restores where it is not needed. This also returns the character
+; originally passed to it and clears DF.
+
+VTPUTC:	PHI AUX\ SEX SP		; save character in a safe place
+	PUSHR(T1)		; save the registers that we use 
+	PUSHR(T2)		; ...
+	PUSHR(P1)		; ...
+	QCALL(VTPUTQ)
+ 	RLDI(T1,CURCHR)		; gotta get back the original data
+	LDN T1\ PHI AUX		; save it for a moment
+	SEX SP\ IRX\ POPR(P1)	; restore the registers we saved
+	POPR(T2)\ POPRL(T1)	; ...
+	CDF\ GHI AUX
+	RETURN			; and we're done!
+
 
 ; Messages ...
 TTMSG:	.TEXT	"[TERMINAL MODE]\r\n\000"
@@ -1930,29 +2065,6 @@ SHORE2:	OUTCHR('R')		; type "Rn="
 ; Messages...
 BPTMSG:	.TEXT	"\r\nBREAK AT \000"
 
-	.SBTTL	Output Characters to the Screen
-;++
-;   This is a wrapper around the VTPUTT routine to save the registers that
-; BASIC or command mode may need preserved but that the terminal routine
-; does not (which calls VTPUTT directly). This saves the overhead of the
-; save and restores where it is not needed. This also returns the character
-; originally passed to it and clears DF.
-
-VTPUTC:	PHI AUX\ SEX SP		; save character in a safe place
-	PUSHR(T1)		; save the registers that we use 
-	PUSHR(T2)		; ...
-	PUSHR(P1)		; ...
-
-	GHI AUX
-	CALL(VTPUTT)
-
- 	RLDI(T1,CURCHR)		; gotta get back the original data
-	LDN T1\ PHI AUX		; save it for a moment
-	SEX SP\ IRX\ POPR(P1)	; restore the registers we saved
-	POPR(T2)\ POPRL(T1)		; ...
-	CDF\ GHI AUX
-VTPUT1:	RETURN			; and we're done!
-
 ;++
 ;   This routine is called whenever we want to send a character to the video
 ; terminal.  It checks to see whether we are in the middle of processing an
@@ -1962,29 +2074,21 @@ VTPUT1:	RETURN			; and we're done!
 ; character then we branch off to NORMAL to handle the alternate character set
 ; and reverse video.
 ;--
-VTPUTT:	PHI AUX			; save character
+VTPUTQ:	STXD			; save the return address
 
 	RLDI(T1,CURCHR)		; point to our local storage
 	GHI AUX\ STR T1		; move the character to CURCHR
 
-	DEC T1\ LDN T1		; and then load ESCSTA
-	LBNZ VTPUT3		; jump if we're processing an escape sequence
+	DEC T1\ LDN T1		; load ESCSTA
+	LBNZ ESCSEQ		; if not zero we are in an escape sequence
 
 	GHI AUX\ ANI $7F	; get the character and trim to 7 bits
-	SMI $7F\ LBZ VTPUT1	; if it's a RUBOUT then do nothing
+	SMI $7F\ LBZ SHRET	; if it's a RUBOUT then do nothing
 
-	ADI $5F\ ADI $20	; if it is not a control character
-	LBNF NORMAL		; then print as normal character
+	ADI $5F\ ADI $20	; is it a control character?
+	LBDF CONTRL		; yes - print as control character
 
-	SHL\ ADI LOW(CTLTAB)	; else double and add to CTLTAB table base
-	PLO T1\ LDI 0		; set pointer low byte
-	ADCI HIGH(CTLTAB)	; setup high byte of address
-	PHI T1\ LBR LBRI2	; call table dispatch
-
-VTPUT3:	SHL\ ADI LOW(ESTATE)	; double it and add to ESTATE tables base
-	PLO T1\ LDI 0		; set pointer low byte
-	ADCI HIGH(ESTATE)	; setup high byte of address
-	PHI T1\ LBR LBRI2	; call table dispatch
+;;;	LBR NORMAL		; fall through to normal character
 
 
 	.SBTTL	Write Normal Characters to the Screen
@@ -2011,7 +2115,7 @@ VTPUT3:	SHL\ ADI LOW(ESTATE)	; double it and add to ESTATE tables base
 NORMAL:	STR SP			; save the character for a minute
 
 ; Check the character set mode...
-	RLDI(T1,ACSMOD)		; point to character set mode flag
+	LDI LOW(ACSMOD)\ PLO T1	; point to character set mode flag
 	LDA T1\ BZ NORMA1	; get and branch if not ACS mode
 	LDN SP\ SMI $60		; is this a lower case letter?
 	BL NORMA1\ STR SP 	; if yes shift it down to 0x00..0x1F
@@ -2020,9 +2124,9 @@ NORMAL:	STR SP			; save the character for a minute
 ;   BTW, don't be tempted to do an "ANI $7F" here, because WFAC uses this
 ; to write field attribute codes to the screen!
 
-NORMA1:	LDA T1\ SEX T1\ INC T1	; point to TOPLIN and get it, move to CURSY
-	ADD\ SHL\ PLO T2	; add CURSY then double and set index lsb
-	LDI HIGH(LINTAB)\ PHI T2; set the page of the table index
+NORMA1:	LDA T1\ INC T1\ INC T1	 ; get TOPLIN and move to CURSY
+	SEX T1\ ADD\ SHL\ PLO T2 ; add CURSY then double and set index lsb
+	LDI HIGH(LINTAB)\ PHI T2 ; set the page of the table index
 
 	DEC T1			; point to CURSX
 	LDA T2\ ADD\ PLO P1	; add low byte of address
@@ -2033,16 +2137,29 @@ NORMA1:	LDA T1\ SEX T1\ INC T1	; point to TOPLIN and get it, move to CURSY
 	LDN T1\ SMI MAXCOL-1	; get CURSX and check if last column
 	BZ NORMA2		; yes - need to adjust row
 	ADI MAXCOL\ STR T1	; no - add one to CURSX
-	LBR LDCURS		; update hardware cursor location
+
+NORMA4:	DEC T1			; move to VISCUR
+	LDN T1\ BZ NORMA5	; the cursor is hidden, don't update
+
+	OUT CRTCMD		; give the load cursor command
+	OUT CRTPRM		; and output X ...
+	OUT CRTPRM		; ... and then Y
+NORMA5:	SEX SP\ LBR SHRET	; ... and return
 
 NORMA2: STR T1\ INC T1		; zero the column and point to CURSY
 	LDN T1\ SMI MAXROW-1	; get CURSY and check if last row
 	BZ NORMA3		; yes - need to scroll up
 	ADI MAXROW\ STR T1	; no - add one to CURSY
-	LBR LDCURS		; update hardware cursor location
+	DEC T1\ BR NORMA4	; update hardware cursor location
 
-NORMA3:	CALL(SCRUP)		; scroll screen up one line
-	LBR LDCURS		; update hardware cursor location
+NORMA3:	DEC T1\ DEC T1		; move to VISCUR
+	LDN T1\ LBZ SCRUP	; if the cursor hidden, don't update
+
+	OUT CRTCMD		; give the load cursor command
+	OUT CRTPRM		; and output X ...
+	OUT CRTPRM		; ... and then Y
+
+	LBR SCRUP		; scroll screen up one line
 
 
 	.SBTTL	Interpret Escape Sequences
@@ -2060,25 +2177,31 @@ NORMA3:	CALL(SCRUP)		; scroll screen up one line
 ; more than one character after the ESCape, we actually need a little state
 ; machine to keep track of what we shold do with the current character.
 ;--
-ESCAPE:	LDI	EFIRST		; next state is EFIRST (ESCAP1)
-ESCNXT:	STR	SP		; save that for a second
+ESCAPE:	LDI EFIRST		; next state is EFIRST (ESCAP1)
+	CALL(ESCSET)
+	LBR SHRET
+
+ESCSET:	STR SP			; save that for a second
 	RLDI(T1,ESCSTA)		; point to the escape state
 	LDN SP\ STR T1		; update the next escape state
-ESCRET:	RETURN			; and then wait for another character
+	RETURN			; and then wait for another character
+
+ESCNXT:	STR SP			; save that for a second
+	RLDI(T1,ESCSTA)		; point to the escape state
+	LDN SP\ STR T1		; update the next escape state
+ESCRET:	LBR SHRET		; and then wait for another character
 
 ;   Here for the first character after the <ESC> - this alone is enough
 ; for most (but not all!) escape sequences.  To that end, we start off by
 ; setting the next state to zero, so if this isn't changed by the action
 ; routine this byte will by default be the last one in the escape sequence.
-ESCAP1:	LDI 0\ CALL(ESCNXT)	; set the next state to zero
+ESCAP1:	LDI 0\ CALL(ESCSET)	; set the next state to zero
 	RLDI(T1,CURCHR)\ LDN T1	; get the current character back again
 	SMI 'A'\ LBL ESCAP4	; is it less than 'A' ?
 	SMI	'Z'-'A'+1	; check the other end of the sequence
 	LBGE	ESCAP3		; ...
 	LDN T1\ SMI 'A'		; convert the character to a zero based index
-	CALL(LBRI)		; and dispatch to the right routine
-	 .WORD	 ESCCHRU	;  ... VT52 standard escape sequences
-	RETURN			; just return
+	LBR	ESCUPR
 
 ;   All our extended, non-standard escape sequences consist of <ESC> followed
 ; by a lower case letter.  If this isn't a standard VT52 escape sequence, then
@@ -2088,9 +2211,7 @@ ESCAP3:	LDN	T1		; get the character after the <ESC> again
 	SMI	'z'-'a'+1	; ...
 	LBGE	ESCRET		; just ignore it if it's not lower case letters
 	LDN T1\ SMI 'a'		; convert to a zero based index
-	CALL(LBRI)		; dispatch to the right routine
-	 .WORD	 ESCCHRL	;  ... extended escape sequences
-	RETURN			; and we're done here
+	LBR	ESCLWR
 
 ;   A real VT52 has two escape sequences where the <ESC> is NOT followed by
 ; a letter - <ESC> = (select alternate keypad mode) and <ESC> > (select
@@ -2119,15 +2240,15 @@ ESCAP4:	LDN T1\ SMI '='		; check for alternate keypad mode
 ;--
 
 ; Here for part 1 - <ESC>Y has been received so far...
-DIRECT:	LDI EYNEXT\ LBR ESCNXT	; next state is get Y
+DIRECT: LDI EYNEXT\ LBR ESCNXT	; next state is get Y
 
 ; Part 2 - the current character is Y, save it and wait for X...
-DIRECY:	RLDI(T1,CURCHR)		; get the current character
+DIRECY: RLDI(T1,CURCHR)		; get the current character
 	LDA T1\ STR T1		; load CURCHR, save in SAVCHR
 	LDI EXNEXT\ LBR ESCNXT	; next state is "get X"
 
 ; Part 3 - CURCHR is X and SAVCHR is Y.
-DIRECX:	RLDI(T1,CURCHR)		; point T1 at CURCHR/SAVCHR
+DIRECX: RLDI(T1,CURCHR)		; point T1 at CURCHR/SAVCHR
 	RLDI(T2,CURSX)		; and T2 at CURSX/CURSY
 
 ;  First handle the X coordinate.  Remember that the cursor moves to the
@@ -2153,8 +2274,8 @@ DIRE22:	STR	T2		; and update CURSY
 
 ;   Finally, update the cursor on the screen and we're done.  DON'T FORGET to
 ; change the next state (ESCSTA) to zero to mark the end of this sequence!
-	CALL(LDCURS)		; load the cursor
-	LDI 0\ LBR ESCNXT	; next state is zero (back to normal)
+	LDI 0\ CALL(ESCSET)	; next state is zero (back to normal)
+	LBR LDCURS
 
 	.SBTTL	Select Graphics, Reverse Video and Alternate Keypad
 
@@ -2167,12 +2288,12 @@ DIRE22:	STR	T2		; and update CURSY
 ; Enable the alternate character set...
 ENAACS:	RLDI(T1,ACSMOD)		; point to the ACS mode flag
 	LDI $FF\ STR T1		; set it to non-zero to enable
-	RETURN			; and we're done
+	LBR SHRET		; and we're done
 
 ; Disable the alternate character set...
 DSAACS:	RLDI(T1,ACSMOD)		; same as before
 	LDI 0\ STR T1		; but set the ACS flag to zero
-	RETURN			; ...
+	LBR SHRET		; ...
 
 
 ;++
@@ -2197,12 +2318,12 @@ DSARVV:	LDI '@'\ LBR WFAC2	; store the normal video attribute
 ; Select alternate keypad mode ...
 ALTKPD:	RLDI(T1,KPDALT)		; point to the alternate keypad mode flag
 	LDI $FF\ STR T1		; and make it non-zero for alternate mode
-	RETURN			; ...
+	LBR SHRET		; ...
 
 ; Select numeric keypad mode ...
 NUMKPD:	RLDI(T1,KPDALT)		; same as above!
 	LDI $00\ STR T1		; but set it to zero for numeric keypad mode
-	RETURN			; ...
+	LBR SHRET		; ...
 
 	.SBTTL	Write Field Attribute Code
 
@@ -2244,7 +2365,7 @@ NUMKPD:	RLDI(T1,KPDALT)		; same as above!
 WFAC:	LDI EANEXT\ LBR ESCNXT	; wait for the field attribute code
 
 ; Here when we receive the next byte...
-WFAC1:	LDI 0\ CALL(ESCNXT)	; first, set ESCSTA to zero
+WFAC1:	LDI 0\ CALL(ESCSET)	; first, set ESCSTA to zero
  	RLDI(T1,CURCHR)\ LDN T1	; and then get the current character
 WFAC2:	ANI $3F\ ORI $80	; make it into a field attribute code
 	STR	SP		; save it on the stack for NORMA1
@@ -2278,7 +2399,7 @@ WFAC2:	ANI $3F\ ORI $80	; make it into a field attribute code
 WLINE:	LDI ELNEXT\ LBR ESCNXT	; wait for the line drawing code
 
 ; Here when we receive the next byte ...
-WLINE1:	LDI 0\ CALL(ESCNXT)	; end of escape sequence
+WLINE1:	LDI 0\ CALL(ESCSET)	; end of escape sequence
  	RLDI(T1,CURCHR)\ LDN T1	; and then get the current character
 	ANI $30\ XRI $30	; disallow the 8275 special function codes!
 	LBZ	WLINE2		;  ... just ignore them
@@ -2287,7 +2408,7 @@ WLINE1:	LDI 0\ CALL(ESCNXT)	; end of escape sequence
 	STR	SP		; save it on the stack for NORMA1
 	RLDI(T1,TOPLIN)		; point to top line of screen
 	LBR	NORMA1		; and then go store it in screen memory
-WLINE2:	RETURN			; just ignore illegal characters
+WLINE2:	LBR SHRET		; just ignore illegal characters
 
 	.SBTTL	Identify (Answerback) Function
 
@@ -2307,7 +2428,7 @@ IDENT2:	CALL(SERPUT)		; ...
 	LDI	'K'		; and the last byte
 IDENT3:	CALL(SERPUT)		; ...
 	 LBDF	 IDENT3		; ...
-	RETURN
+	LBR SHRET
 
 	.SBTTL	Raster Test
 
@@ -2323,97 +2444,60 @@ IDENT3:	CALL(SERPUT)		; ...
 RTEST:	LDI ERNEXT\ LBR ESCNXT	; wait for the next byte
 
 ; Here with the raster test character in CURCHR...
-RTEST1:	LDI 0\ CALL(ESCNXT)	; first set ESCSTA to zero
+RTEST1:	LDI 0\ CALL(ESCSET)	; first set ESCSTA to zero
 	RLDI(T1,CURCHR)\ LDN T1	; then get the current character
 	SMI ' '\ LBNF ERASE	; make sure it is a printing character
 	LDN	T1		; get the character back again
 	XRI $7F\ LBZ ERASE	; make sure it isn't RUBOUT
 	LDN T1\ LBR FILL	; otherwise go fill the screen with it
 
-	.SBTTL	Indirect Table Jump
-
-;++
-;   This routine will take a table of two byte addresses, add the index passed
-; in the D register, and then jump to the selected routine.  It's used to
-; dispatch control characters, escape characters, and the next state for the
-; escape sequence state machine.
-;
-; CALL:
-;	 <put the jump index, 0..n, in D>
-;	 CALL(LBRI)
-;	 .WORD	TABLE
-;  	 .....
-; TABLE: .WORD	fptr0	; address of routine 0
-;	 .WORD	fptr1	;  "   "  "   "   "  1
-;	 ....
-;
-;   Notice that the index starts with zero, not one, and that it's actually
-; an index rather than a table offset.  The difference is that the former 
-; is multiplied by two (since every table entry is a byte) and the latter
-; wouldn't be!
-;
-;   Since this function is called by a CALL() and it actually jumps to the
-; destination routine, that routine can simply execute a RETURN to return
-; back to the original caller.  The inline table address will be automatically
-; skipped.
-;
-; Uses T1 and T2 ...
-;--
-LBRI:	SHL\ STR SP		; multiply the jump index by 2
-	LDA A\ PHI T1		; get the high byte of the table address
-	LDA A\ ADD\ PLO T1	; add the index to the table address
-	GHI T1\ ADCI 0\ PHI T1	; then propagate the carry bit
-
-LBRI2:	RLDI(T2,LBRI1)\ SEP T2	; then switch the PC to T2
-
-; Load the address pointed to by T1 into the PC and continue
-LBRI1:	LDA T1\ PHI PC		; get the high byte of the address
-	LDA T1\ PLO PC		; and then the low byte
-	SEP	PC		; and away we go!
-
 	.SBTTL	Control Character Dispatch Table
 
 ;++
 ;   This table is used by LBRI and VTPUTC to dispatch to the correct function
 ; for any ASCII code .LT. 32.  Any unused control characters should just
-; point to NOOP, which simply executes a RETURN instruction.  Note that the
-; ASCII NUL code is trapped in VTPUTC and never gets here, but its table
-; entry is required anyway to make the rest of the offsets correct.
+; point to NOOP, which simply returns with no action.
 ;--
-CTLTAB:	.WORD	NOOP		; 0x00 ^@ NUL
-	.WORD	NOOP		; 0x01 ^A SOH
-	.WORD	NOOP		; 0x02 ^B STX
-	.WORD	NOOP		; 0x03 ^C ETX
-	.WORD	NOOP		; 0x04 ^D EOT
-	.WORD	IDENT		; 0x05 ^E ENQ - identify (send answerback)
-	.WORD	NOOP		; 0x06 ^F ACK
-	.WORD	BELL		; 0x07 ^G BEL - ring the "bell"
-	.WORD	LEFT		; 0x08 ^H BS  - cursor left (backspace)
-	.WORD	TAB		; 0x09 ^I HT  - move right to next tab stop
-	.WORD	LINEFD		; 0x0A ^J LF  - cursor down and scroll up
-	.WORD	LINEFD		; 0x0B ^K VT  - vertical tab is the same as LF
-	.WORD	ERASE		; 0x0C ^L FF  - form feed erases the screen
-	.WORD	CRET		; 0x0D ^M CR  - move cursor to left margin
-	.WORD	DSAACS		; 0x0E ^N SO  - select normal character set
-	.WORD	ENAACS		; 0x0F ^O SI  - select alternate character set
-	.WORD	NOOP		; 0x10 ^P DLE
-	.WORD	NOOP		; 0x11 ^Q DC1
-	.WORD	NOOP		; 0x12 ^R DC2
-	.WORD	NOOP		; 0x13 ^S DC3
-	.WORD	NOOP		; 0x14 ^T DC4
-	.WORD	NOOP		; 0x15 ^U NAK
-	.WORD	NOOP		; 0x16 ^V SYN
-	.WORD	NOOP		; 0x17 ^W ETB
-	.WORD	NOOP		; 0x18 ^X CAN
-	.WORD	NOOP		; 0x19 ^Y EM
-	.WORD	NOOP		; 0x1A ^Z SUB
-	.WORD	ESCAPE		; 0x1B ^[ ESC - introducer for escape sequences
-	.WORD	NOOP		; 0x1C ^\
-	.WORD	NOOP		; 0x1D ^] GS
-	.WORD	NOOP		; 0x1E ^^ RS
-	.WORD	NOOP		; 0x1F ^_ US
 
-NOOP:	RETURN
+	PAGE
+
+CONTRL:	STR SP\ ADD\ ADD	; multiply index by three
+	ADI LOW(CTLTAB)\ PLO R3	; add base and jump to it
+
+CTLTAB:	LBR	NOOP		; 0x00 ^@ NUL
+	LBR	NOOP		; 0x01 ^A SOH
+	LBR	NOOP		; 0x02 ^B STX
+	LBR	NOOP		; 0x03 ^C ETX
+	LBR	NOOP		; 0x04 ^D EOT
+	LBR	IDENT		; 0x05 ^E ENQ - identify (send answerback)
+	LBR	NOOP		; 0x06 ^F ACK
+	LBR	BELL		; 0x07 ^G BEL - ring the "bell"
+	LBR	LEFT		; 0x08 ^H BS  - cursor left (backspace)
+	LBR	TAB		; 0x09 ^I HT  - move right to next tab stop
+	LBR	LINEFD		; 0x0A ^J LF  - cursor down and scroll up
+	LBR	LINEFD		; 0x0B ^K VT  - vertical tab is the same as LF
+	LBR	ERASE		; 0x0C ^L FF  - form feed erases the screen
+	LBR	CRET		; 0x0D ^M CR  - move cursor to left margin
+	LBR	DSAACS		; 0x0E ^N SO  - select normal character set
+	LBR	ENAACS		; 0x0F ^O SI  - select alternate character set
+	LBR	NOOP		; 0x10 ^P DLE
+	LBR	NOOP		; 0x11 ^Q DC1
+	LBR	NOOP		; 0x12 ^R DC2
+	LBR	NOOP		; 0x13 ^S DC3
+	LBR	NOOP		; 0x14 ^T DC4
+	LBR	NOOP		; 0x15 ^U NAK
+	LBR	NOOP		; 0x16 ^V SYN
+	LBR	NOOP		; 0x17 ^W ETB
+	LBR	NOOP		; 0x18 ^X CAN
+	LBR	NOOP		; 0x19 ^Y EM
+	LBR	NOOP		; 0x1A ^Z SUB
+	LBR	ESCAPE		; 0x1B ^[ ESC - introducer for escape sequences
+	LBR	NOOP		; 0x1C ^\
+	LBR	NOOP		; 0x1D ^] GS
+	LBR	NOOP		; 0x1E ^^ RS
+	LBR	NOOP		; 0x1F ^_ US
+
+NOOP:	LBR SHRET
 
 	.SBTTL	Escape Sequence State Table
 
@@ -2422,15 +2506,18 @@ NOOP:	RETURN
 ; state is stored in location ESCSTA.  When the next character arrives
 ; that value is used as an index into this table to call the next state.
 ;--
-#define XX(n,r)	.WORD r\n .EQU ($-ESTATE-2)/2
+#define EQULBR(n,r)	LBR r\n .EQU ($-ESTATE)/3-1
 
-ESTATE:	.WORD	0		; 0 - never used
-	XX(EFIRST,ESCAP1)	; 1 - first character after <ESC>
-	XX(EYNEXT,DIRECY)	; 2 - <ESC>Y, get first byte (Y)
-	XX(EXNEXT,DIRECX)	; 3 - <ESC>Y, get second byte (X)
-	XX(ERNEXT,RTEST1)	; 4 - <ESC>Q, get first byte
-	XX(EANEXT,WFAC1)	; 5 - <ESC>N, get attribute byte
-	XX(ELNEXT,WLINE1)	; 6 - <ESC>l, get line attribute
+ESCSEQ: STR SP\ ADD\ ADD	; multiply index by three
+	ADI LOW(ESTATE)\ PLO R3	; add base and jump to it
+
+ESTATE:	LBR NOOP		; 0 - never used
+	EQULBR(EFIRST,ESCAP1)	; 1 - first character after <ESC>
+	EQULBR(EYNEXT,DIRECY)	; 2 - <ESC>Y, get first byte (Y)
+	EQULBR(EXNEXT,DIRECX)	; 3 - <ESC>Y, get second byte (X)
+	EQULBR(ERNEXT,RTEST1)	; 4 - <ESC>Q, get first byte
+	EQULBR(EANEXT,WFAC1)	; 5 - <ESC>N, get attribute byte
+	EQULBR(ELNEXT,WLINE1)	; 6 - <ESC>l, get line attribute
 
 	.SBTTL	Escape Sequence Dispatch Table
 
@@ -2441,64 +2528,74 @@ ESTATE:	.WORD	0		; 0 - never used
 ; standard VT52 escape sequence.  Our own custom escape sequences use lower
 ; case letters, which are handled in the next table.
 ;--
-ESCCHRU:.WORD	UP		; <ESC>A -- cursor up
-	.WORD	DOWN		; <ESC>B -- cursor down
-	.WORD	RIGHT		; <ESC>C -- cursor right
-	.WORD	LEFT		; <ESC>D -- cursor left
-	.WORD	ERASE		; <ESC>E -- erase screen
-	.WORD	ENAACS		; <ESC>F -- select alternate character set
-	.WORD	DSAACS		; <ESC>G -- select ASCII character set
-	.WORD	HOME		; <ESC>H -- cursor home
-	.WORD	RLF		; <ESC>I -- reverse line feed
-	.WORD	EEOS		; <ESC>J -- erase to end of screen
-	.WORD	EEOL		; <ESC>K -- erase to end of line
-	.WORD	NOOP		; <ESC>L -- unimplemented
-	.WORD	NOOP		; <ESC>M -- unimplemented
-	.WORD	WFAC		; <ESC>N -- write field attribute code
-	.WORD	NOOP		; <ESC>O -- unimplemented
-	.WORD	NOOP		; <ESC>P -- unimplemented
-	.WORD	NOOP		; <ESC>Q -- unimplemented
-	.WORD	RTEST		; <ESC>R -- raster test
-	.WORD	NOOP		; <ESC>S -- unimplemented
-	.WORD	NOOP		; <ESC>T -- unimplemented
-	.WORD	NOOP		; <ESC>U -- unimplemented
-	.WORD	NOOP		; <ESC>V -- unimplemented
-	.WORD	NOOP		; <ESC>W -- unimplemented
-	.WORD	NOOP		; <ESC>X -- unimplemented
-	.WORD	DIRECT		; <ESC>Y -- direct cursor addressing
-	.WORD	IDENT		; <ESC>Z -- identify
+
+	PAGE
+
+ESCUPR:	STR SP\ ADD\ ADD	; multiply index by three
+	ADI LOW(UPRTAB)\ PLO R3	; add base and jump to it
+
+UPRTAB:	LBR	UP		; <ESC>A -- cursor up
+	LBR	DOWN		; <ESC>B -- cursor down
+	LBR	RIGHT		; <ESC>C -- cursor right
+	LBR	LEFT		; <ESC>D -- cursor left
+	LBR	ERASE		; <ESC>E -- erase screen
+	LBR	ENAACS		; <ESC>F -- select alternate character set
+	LBR	DSAACS		; <ESC>G -- select ASCII character set
+	LBR	HOME		; <ESC>H -- cursor home
+	LBR	RLF		; <ESC>I -- reverse line feed
+	LBR	EEOS		; <ESC>J -- erase to end of screen
+	LBR	EEOL		; <ESC>K -- erase to end of line
+	LBR	NOOP		; <ESC>L -- unimplemented
+	LBR	NOOP		; <ESC>M -- unimplemented
+	LBR	WFAC		; <ESC>N -- write field attribute code
+	LBR	NOOP		; <ESC>O -- unimplemented
+	LBR	NOOP		; <ESC>P -- unimplemented
+	LBR	NOOP		; <ESC>Q -- unimplemented
+	LBR	RTEST		; <ESC>R -- raster test
+	LBR	NOOP		; <ESC>S -- unimplemented
+	LBR	NOOP		; <ESC>T -- unimplemented
+	LBR	NOOP		; <ESC>U -- unimplemented
+	LBR	NOOP		; <ESC>V -- unimplemented
+	LBR	NOOP		; <ESC>W -- unimplemented
+	LBR	NOOP		; <ESC>X -- unimplemented
+	LBR	DIRECT		; <ESC>Y -- direct cursor addressing
+	LBR	IDENT		; <ESC>Z -- identify
 
 
 ;++
 ;   And this table decodes escape sequences where the next character after
 ; the <ESC> is a lower case letter.  These are our own VT1802 custom sequences.
 ;--
-ESCCHRL:.WORD	NOOP		; <ESC>a -- unimplemented
-	.WORD	NOOP		; <ESC>b -- unimplemented
-	.WORD	NOOP		; <ESC>c -- unimplemented
-	.WORD	ENACURS		; <ESC>d -- display cursor
-	.WORD	NOOP		; <ESC>e -- unimplemented
-	.WORD	NOOP		; <ESC>f -- unimplemented
-	.WORD	NOOP		; <ESC>g -- unimplemented
-	.WORD	DSACURS		; <ESC>h -- hide cursor
-	.WORD	NOOP		; <ESC>i -- unimplemented
-	.WORD	NOOP		; <ESC>j -- unimplemented
-	.WORD	NOOP		; <ESC>k -- unimplemented
-	.WORD	WLINE		; <ESC>l -- draw line
-	.WORD	NOOP		; <ESC>m -- unimplemented
-	.WORD	DSARVV		; <ESC>n -- disable reverse video
-	.WORD	NOOP		; <ESC>o -- unimplemented
-	.WORD	NOOP		; <ESC>p -- unimplemented
-	.WORD	NOOP		; <ESC>q -- unimplemented
-	.WORD	ENARVV		; <ESC>r -- enable reverse video
-	.WORD	NOOP		; <ESC>s -- unimplemented
-	.WORD	NOOP		; <ESC>t -- unimplemented
-	.WORD	NOOP		; <ESC>u -- unimplemented
-	.WORD	NOOP		; <ESC>v -- enable auto newline
-	.WORD	NOOP		; <ESC>w -- disable auto newline
-	.WORD	NOOP		; <ESC>x -- unimplemented
-	.WORD	NOOP		; <ESC>y -- unimplemented
-	.WORD	NOOP		; <ESC>z -- unimplemented
+
+ESCLWR:	STR SP\ ADD\ ADD	; multiply index by three
+	ADI LOW(LWRTAB)\ PLO R3	; add base and jump to it
+
+LWRTAB:	LBR	NOOP		; <ESC>a -- unimplemented
+	LBR	NOOP		; <ESC>b -- unimplemented
+	LBR	NOOP		; <ESC>c -- unimplemented
+	LBR	ENACURS		; <ESC>d -- display cursor
+	LBR	NOOP		; <ESC>e -- unimplemented
+	LBR	NOOP		; <ESC>f -- unimplemented
+	LBR	NOOP		; <ESC>g -- unimplemented
+	LBR	DSACURS		; <ESC>h -- hide cursor
+	LBR	NOOP		; <ESC>i -- unimplemented
+	LBR	NOOP		; <ESC>j -- unimplemented
+	LBR	NOOP		; <ESC>k -- unimplemented
+	LBR	WLINE		; <ESC>l -- draw line
+	LBR	NOOP		; <ESC>m -- unimplemented
+	LBR	DSARVV		; <ESC>n -- disable reverse video
+	LBR	NOOP		; <ESC>o -- unimplemented
+	LBR	NOOP		; <ESC>p -- unimplemented
+	LBR	NOOP		; <ESC>q -- unimplemented
+	LBR	ENARVV		; <ESC>r -- enable reverse video
+	LBR	NOOP		; <ESC>s -- unimplemented
+	LBR	NOOP		; <ESC>t -- unimplemented
+	LBR	NOOP		; <ESC>u -- unimplemented
+	LBR	NOOP		; <ESC>v -- enable auto newline
+	LBR	NOOP		; <ESC>w -- disable auto newline
+	LBR	NOOP		; <ESC>x -- unimplemented
+	LBR	NOOP		; <ESC>y -- unimplemented
+	LBR	NOOP		; <ESC>z -- unimplemented
 
 	.SBTTL	Advanced Cursor Motions
 
@@ -2541,7 +2638,6 @@ CRIGHT:	RLDI(T1,CURSX)		; change the X cursor position
 ; bottom of the screen. In this case the screen is scrolled up one line and
 ; the cursor remains in the same location (on the bottom line of the screen).
 ;--
-AUTONL:	CALL(CRET)		; here for an auto carriage return/line feed
 LINEFD: RLDI(T1,CURSY)\ LDN T1	; get the line location of the cursor
 	SMI	MAXROW-1	; is it on the bottom of the screen ?
 	LBL	DOWN		; just do a down operation if it is
@@ -2571,7 +2667,6 @@ SCRUP:	RLDI(T1,TOPLIN)		; pointer to current top line on the screen
 	LSZ\ ADI MAXROW		; if yes, set to zero, if not add one to row
 	STR	T1		; save new row number
 	GLO	P1		; then get back the number of the bottom line
-	CALL(LINADD)		; calculate its address
 	LBR	CLRLIN		; and then go clear it
 
 
@@ -2584,7 +2679,6 @@ SCRUP:	RLDI(T1,TOPLIN)		; pointer to current top line on the screen
 SCRDWN:	RLDI(T1,TOPLIN)\ LDN T1	; get the top line of the screen
 	LSNZ\ LDI MAXROW	; keep if not zero, else get line after last
 	SMI 1\ STR T1		; move to previous line and save
-	CALL(LINADD)		; calculate the address of this line
 	LBR	CLRLIN		; and then go clear it
 
 	.SBTTL	Clear Screen Function
@@ -2605,14 +2699,18 @@ ERASE:	LDI	' '		; fill the screen with a blank character
 ; interrupts are delayed.
 ;--
 FILL:	PUSHD			; save the fill character for a while
-	CALL(HOME)		; go move the cursor to home
+
+	RLDI(T1,CURSX)		; (CURSX comes before CURSY)
+	LDI 0\ STR T1		; set both CURSX and CURSY to zero
+	INC T1\ STR T1		; ...
+
 	POPD\ PLO T1		; get the fill character back
 	RLDI(T2,SCREEN)		; then point to the start of the screen space
 ; Fill the active area of the screen with whatever character was given ...
 FILL1:	GLO T1\ STR T2\ INC T2	; fill this location
 	GHI T2			; have we reached the end of the screen?
-	LBNZ	FILL1		; no - keep going
-	RETURN			; finally - all done!
+	LBNZ FILL1		; no - keep going
+	LBR LDCURS		; finally - all done!
 
 	.SBTTL	Screen Erase Functions
 
@@ -2635,7 +2733,7 @@ EEOS2:	GLO P1\ STR SP		; get the low byte of the address (again!)
 	GHI P1\ STR SP		; maybe -- we need to check the high byte too
 	GHI T2\ XOR		; ????
 	LBNZ	EEOS1		; keep on going if we aren't there yet
-	RETURN			; otherwise that's all there is to it
+	LBR SHRET		; otherwise that's all there is to it
 
 
 ;++
@@ -2645,15 +2743,22 @@ EEOS2:	GLO P1\ STR SP		; get the low byte of the address (again!)
 ; to a space character. The loop is unrolled by a factor of four for speed;
 ; this means that MAXCOL needs to be a multiple of four, which is not unusual.
 ;--
-CLRLIN:	LDI MAXCOL/4\ PLO T1	; interation count for unrolled loop
+CLRLIN: SHL\ PLO T1		; index into the line address table
+	LDI HIGH(LINTAB)\ PHI T1; now set the high byte
+	LDA T1\ PLO P1		; that's the line address
+	LDN T1\ PHI P1		; ...
+
+	LDI MAXCOL/8\ PLO T1	; interation count for unrolled loop
 	GLO P1\ ADI MAXCOL-1	; address of last byte on line
 	PLO P1\ GHI P1\ ADCI 0	; add carry to msb if neededsave it
 	PHI P1\ SEX P1		; save and set x=p1
+
 CLRLI1:	LDI ' '			; get a space
 	STXD\ STXD\ STXD\ STXD	; and set next four bytes to it
+	STXD\ STXD\ STXD\ STXD	; and set next four bytes to it
 	DEC T1\ GLO T1		; check loop count
-	LBNZ    CLRLI1		; repeat until done
-	RETURN			; and that's all for now
+	LBNZ CLRLI1		; repeat until done
+	SEX SP\ LBR SHRET	; and that's all for now
 
 ;++
 ;   This routine will erase all characters from the current cursor location to
@@ -2666,7 +2771,7 @@ EEOL:	CALL(WHERE)		; set P1 = address of the cursor
 EEOL1:	LDI ' '\ STR P1		; clear this character to a blank
 	INC P1\ INC T1\ GLO T1	; advance to the next character
 	LBNZ	EEOL1		; keep going until EOL
-	RETURN			; then that's all there is
+	LBR SHRET		; then that's all there is
 
 	.SBTTL	Basic Cursor Motions
 
@@ -2735,21 +2840,20 @@ DOWN:	RLDI(T1,CURSY)		; get the row number where the cursor is
 ; the software location.  This is called after most cursor motion functions
 ; to actually change the picture on the screen...  Uses (but doesn't save) T1!
 ;
-;   If the HIDCURS flag is non-zero, then the cursor display is "hidden" and
+;   If the VISCUR flag is zero, then the cursor display is "hidden" and
 ; you don't see a cursor on the screen.  The cursor has already been hidden
 ; in this case by moving it to an off-screen address, we just need to not
 ; reset it so it stays hidden.
 ;--
-LDCURS:	RLDI(T1,HIDCURS)\ LDN T1; is the cursor hidden ?
-	LBNZ LDCUR2		; yes -- nothing to do then
+LDCURS:	RLDI(T1,VISCUR)\ LDN T1	; is the cursor hidden ?
+	LBZ LDCUR2		; yes -- nothing to do then
 
 ; Here to show the real cursor ...
-LDCUR1:	LDI LOW(CURSX)\ PLO T1	; point to the cursor location
-	SEX PC\ OUT CRTCMD	; give the load cursor command
-	.BYTE CC.LCUR		; ...
-	SEX T1\ OUT CRTPRM	; and output X ...
+LDCUR1:	SEX T1
+	OUT CRTCMD	; give the load cursor command
+	OUT CRTPRM		; and output X ...
 	OUT CRTPRM		; ... and then Y
-LDCUR2:	RETURN			; ... and return
+LDCUR2:	SEX SP\ LBR SHRET	; ... and return
 
 ;++
 ;   This subroutine will compute the actual address of the character under the
@@ -2758,7 +2862,8 @@ LDCUR2:	RETURN			; ... and return
 ; screen after scrolling).  The address computed is returned in P1.
 ;--
 WHERE:	RLDI(T1,TOPLIN)\ LDA T1	; get TOPLIN first
-	INC T1\ SEX T1\ ADD	; compute TOPLIN+CURSY
+	INC T1\ INC T1		; move to CURSY
+	SEX T1\ ADD		; compute TOPLIN+CURSY
 	CALL(LINADD)		; set P1 = address of the cursor line
 	RLDI(T1,CURSX)		; (LINADD trashes T1!)
 	GLO P1\ SEX T1\ ADD	; and add CURSX
@@ -2775,25 +2880,25 @@ CURRET:	RETURN			; leave the address in P1 and we're done...
 ;
 ;   The i8275 doesn't actually have a way to hide or disable the display of
 ; the cursor, so what we do here is set the cursor to a location that is off
-; of the screen, and set the HIDCURS flag so that LDCURS knows not to set the
-; location any more since that would unhide it.
+; of the screen, and zero the VISCURS byte so that LDCURS knows not to set
+; the location any more since that would unhide it.
 ;--
-DSACURS:RLDI(T1,HIDCURS)	; point to the cursor display flag
-	LDI $FF\ STR T1		; set to non-zero to hide the cursor
+DSACURS:RLDI(T1,VISCUR)	; point to the cursor display flag
+	LDI 0\ STR T1		; set to zero to hide the cursor
 
 	SEX PC\ OUT CRTCMD	; give the load cursor command
 	.BYTE CC.LCUR		; ...
 	OUT CRTPRM\ .BYTE 80 	; off-screen regardless of MAXCOL/MAXROW
 	OUT CRTPRM\ .BYTE 64	; ...
-	RETURN			; return
+	SEX SP\ LBR SHRET	; return
 
 ;++
 ;   The <ESC>d sequence will undo the effects of an <ESC>h and re-enable
 ; display of the cursor ...
 ;--
-ENACURS:RLDI(T1,HIDCURS)	; ...
-	LDI $00\ STR T1		; set the HIDCURS flag to zero
-	LBR	LDCUR1		; and display the cursor
+ENACURS:RLDI(T1,VISCUR)	; ...
+	LDI CC.LCUR\ STR T1	; set the VISCUR flag to CC.LCUR
+	LBR LDCUR1		; and display the cursor
 
 	.SBTTL	Compute the Address of Any Line
 
@@ -2816,7 +2921,7 @@ LINADD: SHL\ PLO T1		; index into the line address table
 ; first, as this aids with arithmetic as we can do LSB first with LDA.
 ;
 ;   This table is page aligned so that the LSB of the first entry starts the
-; page, this saves having to add one later. Also, the table repears twice
+; page, this saves having to add one later. Also, the table repeats twice
 ; so that we can add TOPLIN and CURSY and use it directly as an index without
 ; wrapping the value around; the modulo operation is built into the table.
 ;
@@ -2897,7 +3002,7 @@ BELL:	OUTI(TONE,BELLNOTE)	; program the CDP1863 for 440Hz
 ; About half a second sounds like a good value...
 	LDI BELLTIME		; ...
 	STR	T1		; set TTIMER
-	RETURN			; that's all we have to do!
+	SEX SP\ LBR SHRET	; that's all we have to do!
 
 	.SBTTL	Display Startup Splash Screen
 
@@ -2908,7 +3013,10 @@ BELL:	OUTI(TONE,BELLNOTE)	; program the CDP1863 for 440Hz
 ; we receive any input from the PS/2 keyboard or the serial port.  After
 ; that, the screen is cleared and we return.
 ;--
-SPLASH:	LDI $7F\ CALL(FILL)	; fill the screen with "pin cushion" symbols
+
+SPLASH:	RLDI(T1,SCREEN)		; fill the screen with "pin cushion" symbols
+SPL12:	LDI $7F\ STR T1\ INC T1
+	GHI T1\ LBNZ SPL12
 
 ;   The only goal of all this code is to clear out a rectangle in the middle
 ; of the screen.  It takes more code then I'd like, but there's no other way!
@@ -2975,8 +3083,9 @@ SPLAS8:	RLDI(T1,RXGETP)\ LDA T1	; get the receiver circular buffer pointer
 	LBZ	SPLAS8		; yes - keep waiting
 
 ; All done ...
-SPLAS9:	CALL(RSTIO)		; reset the console input
-	CALL(ERASE)		; erase the screen
+SPLAS9: SEX SP
+	INLMES("\033E")		; erase the screen
+	CALL(RSTIO)		; reset the console input
 	RETURN			; all done
 
 ; Messages...
@@ -4217,7 +4326,6 @@ SLUIS2:	RLDI(T1,SLUFMT)\ LDN T1	; get the current SLU format bits
 ; There's nothing more to do!
 SLUIS3:	SEX SP\ LBR ISRDON	; dismiss the interrupt and we're done
 
-	.SBTTL	Serial Port Buffer Routines
 
 ;++
 ;   This routine will extract and return the next character from the serial
@@ -4228,7 +4336,8 @@ SLUIS3:	SEX SP\ LBR ISRDON	; dismiss the interrupt and we're done
 ; pointers; otherwise we risk a race condition if a serial port interrupt
 ; occurs while we're here.
 ;--
-SERGET:	PUSHR(T1)		; save a temporary register
+SERGEQ:	STXD			; save the return address
+
 	RLDI(T1,RXGETP)		; load the RXBUF GET pointer
 	SEX PC\ DIS		; disable interrupts and SEX T1
 	.BYTE (T1<<4)|PC	; ...
@@ -4256,16 +4365,8 @@ SERGE0:	DEC T1			; point back to GET pointer
 
 SERGE1:	SEX PC\ RET		; allow interrupts and SEX SP
 	.BYTE (SP<<4)|PC	; ...
-	IRX\ POPRL(T1)		; restore T1 from stack
-	GHI AUX\ RETURN		; recover character and return it
+	LBR SHRET
 
-;++
-;  This is just like SERGET, except that it will wait for input if none is
-; available now.  There's no timeout on the wait!
-;--
-SERGEW:	CALL(SERGET)		; try to read something
-	LBDF	SERGEW		; and loop until there's something there
-	RETURN			; ...
 
 
 ;++
@@ -4282,7 +4383,7 @@ SERGEW:	CALL(SERGET)		; try to read something
 ; already busy, then setting TR does nothing so it's safe to simply always set
 ; TR, regardless.
 ;--
-SERPUT:	PHI AUX\ PUSHR(T1)	; save a temporary register
+SERPUQ:	STXD			; save return address
 	IOFF			; interrupts OFF while we mess with the buffer
 	RLDI(T1,TXPUTP)\ LDN T1	; load the current PUT pointer first
 	ADI 1\ ANI TXBUFSZ-1	; increment it w/wrap around
@@ -4299,16 +4400,7 @@ SERPUT:	PHI AUX\ PUSHR(T1)	; save a temporary register
 ; Here if the TX buffer is full!
 SERPU1:	SDF			; return the original character and DF=1
 SERPU2:	ION			; interrupts on again
-	IRX\ POPRL(T1)		; restore T1
-	GHI AUX\ RETURN		; and we're done
-
-;++
-;   And this routine is just like SERPUT, except that it will wait for space
-; to be available if the buffer is currently full.
-;--
-SERPUW:	CALL(SERPUT)		; try to buffer this character
-	LBDF	SERPUW		; keep waiting until space is available
-	RETURN			; ...
+	LBR SHRET
 
 	.SBTTL	Serial Port Break Routines
 
@@ -4478,58 +4570,13 @@ BAUDS:	.BYTE	BAUD_DIVISOR( 110)	; 0   0   0	 110
 ;   And of course if the next key code is a normal ASCII character, then we
 ; just return it immediately, with no funny business.
 ;--
-GETKEY:	PUSHR(T1)\ PUSHR(T2)	; save two working registers
+
+GETKEQ:	STXD			; push return address
+
 	RLDI(T1,KEYPBK)		; anything is waiting in the push back buffer?
 	LDN T1\ LBNZ GETKE1	; yes - go send that!
+
 ; Try to read the next keycode from the interrupt buffer ...
-	CALL(KEYGET)		; try to get a keycode
-	LBDF	GETKE3		; nothing there - just return now
-	PHI AUX\ ANI $80	; is this an extended key code?
-	LBZ	GETKE2		; no - regular ASCII character
-	DEC T1\ LDA T1		; get the keypad application mode flag
-	LBNZ	GETKE0		; branch if application mode
-	GHI AUX\ ANI $F0	; was the key code a keypad key
-	XRI $A0\ LBZ GETKE4	; yes - handle numeric keypad codes
-; Here if we need to send an escape sequence ...
-GETKE0:	GHI AUX\ ANI $7F	; get the key code back
-	SMI KEYELEN\ LBGE GETKE3; just ignore it if out of range
-	GHI AUX\ ANI $7F\ SHL	; each table entry is 2 bytes
-	ADI LOW(KEYESC)\ PLO T2	; index into the KEYESC table
-	LDI 0\ ADCI HIGH(KEYESC); ...
-	PHI T2\ LDA T2\ STR T1	; copy two bytes to KEYPBK
-	LBZ	GETKE3		; if the table entry is zero, ignore it
-	INC T1\ LDA T2\ STR T1	; ...
-	LDI CH.ESC\ PHI AUX	; and return <ESC> for the first byte
-	LBR	GETKE2		; ... all done for now
-; Here for a keypad key in numeric keypad mode ...
-GETKE4:	GHI AUX\ ANI $0F	; get the keycode
-	ADI LOW(KEYNUM)\ PLO T2	; index into the numeric keypad table
-	LDI 0\ ADCI HIGH(KEYNUM); ...
-	PHI T2\ LDN T2\ PHI AUX	; get the ASCII code from the KEYNUM table
-	LBR	GETKE2		; and return that
-; Here to return the next byte from the push back buffer ...
-GETKE1:	PHI	AUX		; save the byte we want to send
-	INC T1\ LDN T1		; and pop a byte off the push back buffer
-	DEC T1\ STR T1		; ...
-	INC T1\ LDI 0\ STR T1	; ...
-; Success - we have an ASCII code of some kind ...
-GETKE2:	CDF\ LSKP		; return DF=0
-; Here if no keys are available ...
-GETKE3:	SDF			; return DF=1
-	IRX\ POPR(T2)\ POPRL(T1); restore saved registers
-	GHI AUX\ RETURN		; and we're done
-
-
-;++
-;   This routine will extract and return the next character from the keyboard
-; buffer and return it in D.  If the buffer is empty then it returns DF=1.
-; Uses T1 ...
-;
-;   Note that we have to disable interrupts while we mess with the buffer
-; pointers; otherwise we risk a race condition if a keyboard port interrupt
-; occurs while we're here.
-;--
-KEYGET:	PUSHR(T1)		; save a temporary register
 	IOFF			; no interrupts for now
 	RLDI(T1,KEYGETP)\ LDA T1; load the GET pointer
 	SEX  T1\ XOR		; does GET == PUT?
@@ -4543,10 +4590,58 @@ KEYGET:	PUSHR(T1)		; save a temporary register
 	CDF\ LSKP		; and return with DF=0
 KEYGE1:	SDF			; buffer empty - return DF=1
 	ION			; allow interrupts again
-	PHI AUX\ IRX\ POPRL(T1)	; restore T1
-	GHI AUX\ RETURN		; and we're done
+	PHI AUX
+	RLDI(T1,KEYPBK)		; anything is waiting in the push back buffer?
 
+	LBDF	GETKE3		; nothing there - just return now
+	GHI AUX\ ANI $80	; is this an extended key code?
+	LBZ	GETKE2		; no - regular ASCII character
+	DEC T1\ LDA T1		; get the keypad application mode flag
+	LBNZ	GETKE0		; branch if application mode
+	GHI AUX\ ANI $F0	; was the key code a keypad key
+	XRI $A0\ LBZ GETKE4	; yes - handle numeric keypad codes
 
+; Here if we need to send an escape sequence ...
+GETKE0:	GHI AUX\ ANI $7F	; get the key code back
+	SMI KEYELEN\ LBGE GETKE3; just ignore it if out of range
+	GHI AUX\ ANI $7F\ SHL	; each table entry is 2 bytes
+	ADI LOW(KEYESC)\ PLO T2	; index into the KEYESC table
+	LDI 0\ ADCI HIGH(KEYESC); ...
+	PHI T2\ LDA T2\ STR T1	; copy two bytes to KEYPBK
+	LBZ	GETKE3		; if the table entry is zero, ignore it
+	INC T1\ LDA T2\ STR T1	; ...
+	LDI CH.ESC\ PHI AUX	; and return <ESC> for the first byte
+	LBR	GETKE2		; ... all done for now
+
+; Here for a keypad key in numeric keypad mode ...
+GETKE4:	GHI AUX\ ANI $0F	; get the keycode
+	ADI LOW(KEYNUM)\ PLO T2	; index into the numeric keypad table
+	LDI 0\ ADCI HIGH(KEYNUM); ...
+	PHI T2\ LDN T2\ PHI AUX	; get the ASCII code from the KEYNUM table
+	LBR	GETKE2		; and return that
+
+; Here to return the next byte from the push back buffer ...
+GETKE1:	PHI	AUX		; save the byte we want to send
+	INC T1\ LDN T1		; and pop a byte off the push back buffer
+	DEC T1\ STR T1		; ...
+	INC T1\ LDI 0\ STR T1	; ...
+
+; Success - we have an ASCII code of some kind ...
+GETKE2:	CDF\ LSKP		; return DF=0
+
+; Here if no keys are available ...
+GETKE3:	SDF			; return DF=1
+	LBR SHRET
+
+;++
+;   This routine will extract and return the next character from the keyboard
+; buffer and return it in D.  If the buffer is empty then it returns DF=1.
+; Uses T1 ...
+;
+;   Note that we have to disable interrupts while we mess with the buffer
+; pointers; otherwise we risk a race condition if a keyboard port interrupt
+; occurs while we're here.
+;--
 ;++
 ;   Test the keyboard break flag and return DF=1 (and also clear the flag)
 ; if it's set. 
